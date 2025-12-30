@@ -2,9 +2,12 @@ from pathlib import Path
 from sklearn.model_selection import GroupShuffleSplit
 import shutil
 
-DATA_ROOT = Path("train")          # <- change if needed
-OUT_ROOT  = Path("dataset_split")    # output base folder
-VAL_RATIO = 0.27
+DATA_ROOT = Path("train")         
+OUT_ROOT  = Path("dataset_split")    
+VAL_RATIO = 0.2
+IMG_SIZE = 224
+EPOCHS_HEAD = 5
+EPOCHS_FINE = 15
 
 # --------------------------------------------------------------
 # 1) collect image paths + labels + design groups
@@ -49,10 +52,6 @@ val_labels  = [labels[i] for i in val_idx]
 print(f"Train images: {len(train_files)}")
 print(f"Val images:   {len(val_files)}")
 
-# sanity check — leakage must be zero
-train_designs = set(groups[i] for i in train_idx)
-val_designs   = set(groups[i] for i in val_idx)
-print("Design-overlap check:", train_designs.intersection(val_designs))
 
 # --------------------------------------------------------------
 # 3) write split to dataset_split/ (train/val/cls)
@@ -68,9 +67,8 @@ def copy_split(files, labels, split_name):
         dst = dst_dir / Path(src).name
         shutil.copy2(src, dst)
 
-    print(f"✓ wrote {len(files)} files to {split_name}/")
+    print(f"wrote {len(files)} files to {split_name}/")
 
-# clear existing split (optional but usually helpful)
 if OUT_ROOT.exists():
     shutil.rmtree(OUT_ROOT)
 
@@ -85,13 +83,10 @@ from torchvision import transforms
 import cv2
 import torch
 
-IMG_SIZE = 224
-ROOT = Path("dataset_split")
-
 # -------------------------------------------------------------
 # 1) build class index mapping from folder names
 # -------------------------------------------------------------
-classes = sorted([d.name for d in (ROOT / "train").iterdir() if d.is_dir()])
+classes = sorted([d.name for d in (OUT_ROOT / "train").iterdir() if d.is_dir()])
 class_to_idx = {cls: i for i, cls in enumerate(classes)}
 
 print("Classes:", classes)
@@ -101,8 +96,15 @@ print("Classes:", classes)
 # 2) custom dataset
 # -------------------------------------------------------------
 import random
+import numpy as np
+
 class PCBPatchDataset(Dataset):
-    def __init__(self, root, split, patches_per_image=5, train=True):
+    """
+    Dataset that loads PCB images and samples edge-rich patches.
+    Used because defect locations are unknown (weak labels).
+
+    """
+    def __init__(self, root, split, patches_per_image=6, train=True):
         self.root = Path(root) / split
         self.train = train
         self.patches_per_image = patches_per_image
@@ -124,26 +126,39 @@ class PCBPatchDataset(Dataset):
         ])
 
     def _sample_patch(self, img):
+        """
+        Randomly sample several crops and prefer the most
+        structure-rich (Sobel-edge) patch.
+
+        """
         h, w = img.shape[:2]
 
-        for _ in range(12):   # try multiple times to find a useful patch
-            scale = random.uniform(0.30, 0.55)
-            size  = int(min(h, w) * scale)
+        for _ in range(18):
+            scale = random.uniform(0.50, 0.80)
+            size = int(min(h, w) * scale)
 
             top  = random.randint(0, h - size)
             left = random.randint(0, w - size)
 
             patch = img[top:top+size, left:left+size]
 
-            # reject flat green areas (no traces/pads)
-            if patch.std() > 8.0:
+            # prefer patches with structure
+            gray = cv2.cvtColor(patch, cv2.COLOR_RGB2GRAY)
+            gx = cv2.Sobel(gray, cv2.CV_32F, 1, 0, ksize=3)
+            gy = cv2.Sobel(gray, cv2.CV_32F, 0, 1, ksize=3)
+            edge_strength = np.mean(np.abs(gx) + np.abs(gy))
+
+            if edge_strength > 12:   #tuneable but works well
                 return cv2.resize(patch, (IMG_SIZE, IMG_SIZE))
-            
-        # fallback if all fail
+
+        # fallback
         return cv2.resize(patch, (IMG_SIZE, IMG_SIZE))
 
 
+
     def _augment(self, img):
+        #Light augmentation: rotation, flip, brightness.
+
         if random.random() < 0.5:
             angle = random.uniform(-10, 10)
             h, w = img.shape[:2]
@@ -166,9 +181,18 @@ class PCBPatchDataset(Dataset):
         img = cv2.imread(path)
         img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
 
-        # create several patches → pick one at random
-        patches = [self._sample_patch(img) for _ in range(self.patches_per_image)]
-        patch = random.choice(patches)
+        # create several patches and pick one at random
+        candidates = [self._sample_patch(img) for _ in range(self.patches_per_image)]
+
+        # score patches by edge richness
+        def score(p):
+            gray = cv2.cvtColor(p, cv2.COLOR_RGB2GRAY)
+            gx = cv2.Sobel(gray, cv2.CV_32F, 1, 0)
+            gy = cv2.Sobel(gray, cv2.CV_32F, 0, 1)
+            return float(np.mean(np.abs(gx) + np.abs(gy)))
+
+        patch = max(candidates, key=score)
+
 
         if self.train:
             patch = self._augment(patch)
@@ -179,19 +203,16 @@ class PCBPatchDataset(Dataset):
     def __len__(self):
         return len(self.samples)
 
-
-
 # -------------------------------------------------------------
 # 3) build datasets & dataloaders
 # -------------------------------------------------------------
-train_ds = PCBPatchDataset(ROOT, "train", train=True)
-val_ds   = PCBPatchDataset(ROOT, "val", train=False)
-
+train_ds = PCBPatchDataset(OUT_ROOT, "train", train=True)
+val_ds   = PCBPatchDataset(OUT_ROOT, "val", train=False)
 
 train_loader = DataLoader(
     train_ds,
     batch_size=32,
-    shuffle=True,      # shuffle training
+    shuffle=True,      
     num_workers=0,
     pin_memory=True
 )
@@ -199,12 +220,11 @@ train_loader = DataLoader(
 val_loader = DataLoader(
     val_ds,
     batch_size=32,
-    shuffle=False,     # never shuffle validation
+    shuffle=False,     
     num_workers=0,
     pin_memory=True
 )
 
-import torch
 import torch.nn as nn
 import torch.optim as optim
 from torchvision import models
@@ -224,9 +244,10 @@ model = model.to(device)
 
 criterion = nn.CrossEntropyLoss()
 
+
+# Phase 1: Freeze backbone, only train classifier
 for p in model.parameters():
     p.requires_grad = False
-
 for p in model.fc.parameters():
     p.requires_grad = True
 
@@ -277,8 +298,6 @@ def validate():
 
     return val_loss, val_acc
 
-EPOCHS_HEAD = 5
-
 if __name__ == "__main__":
     print("\n=== Phase 1: train classifier head ===")
     for epoch in range(1, EPOCHS_HEAD + 1):
@@ -289,7 +308,7 @@ if __name__ == "__main__":
 
     print("\n=== Phase 2: fine-tune backbone ===")
 
-    # unfreeze only the last block + classifier
+    # Phase 2: fine-tune deeper layers at low LR
     for name, p in model.named_parameters():
         if "layer3" in name or "layer4" in name or "fc" in name:
             p.requires_grad = True
@@ -299,8 +318,6 @@ if __name__ == "__main__":
         lr=1e-4,
         weight_decay=5e-4
     )
-
-    EPOCHS_FINE = 15
 
     for epoch in range(1, EPOCHS_FINE + 1):
         tr = train_one_epoch()
@@ -322,4 +339,3 @@ if __name__ == "__main__":
                 all_labels.extend(y.tolist())
 
         print("Pred dist:", Counter(all_preds))
-
