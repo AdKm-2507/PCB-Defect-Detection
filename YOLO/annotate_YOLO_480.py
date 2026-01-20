@@ -1,3 +1,6 @@
+""" 
+Custom Script for using the model trained on 120 images to train remaining 480 images.
+"""
 from ultralytics import YOLO
 from pathlib import Path
 import re
@@ -74,3 +77,4 @@ for r in results:
         f.write("\n".join(filtered_lines))
 
 print("Smart auto-labeling finished.")
+
