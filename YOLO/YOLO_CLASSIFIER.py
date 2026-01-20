@@ -1,3 +1,8 @@
+""" 
+Custom Python script using which the YOLO model was tested using the following dataset: 
+https://drive.google.com/file/d/1Tw173zx3rGKYO46V7AZtiWgg4I5pjdxV/view?usp=drive_link
+"""
+
 import os
 from collections import Counter
 from ultralytics import YOLO
@@ -6,9 +11,9 @@ from sklearn.metrics import accuracy_score, classification_report, confusion_mat
 import numpy as np
 
 # ---------------- CONFIG ----------------
-MODEL_PATH = "runs/detect/train26/weights/best.pt"   # adjust
-TEST_IMAGES = r"C:/Users/Dell/projects/python/GIGA YOLO 600/test/test/images"
-TEST_LABELS = r"C:/Users/Dell/projects/python/GIGA YOLO 600/test/test/labels"
+MODEL_PATH = "PATH"   # adjust
+TEST_IMAGES = r"../test/images"
+TEST_LABELS = r"../test/labels"
 
 CLASS_NAMES = [
     "missing_hole",
@@ -76,3 +81,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
